@@ -1,4 +1,5 @@
 data_creation/condor_pipeline/IDEA/noBackground/std/
+data_creation/condor_pipeline/ALLEGRO/noBackground_parquet/output
 *.sub
 data_train/
 data_val/
