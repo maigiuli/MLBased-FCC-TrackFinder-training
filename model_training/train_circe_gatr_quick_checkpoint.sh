@@ -37,6 +37,7 @@ export NUM_EPOCHS=1
 export LIMIT_TRAIN_BATCHES=1
 export LIMIT_VAL_BATCHES=1
 export BATCH_SIZE="${QUICK_BATCH_SIZE:-1}"
+export MAX_TOKENS=0
 export NUM_WORKERS="${QUICK_NUM_WORKERS:-0}"
 export FETCH_FILES=1
 export SWEEP_MAX_EVENTS=1
@@ -53,9 +54,14 @@ echo "Output directory: $RUN_DIR"
 
 case "$MODEL" in
     circe)
-        CHECKPOINT="$RUN_DIR/circe/cgatr_best.ckpt"
-        if [[ ! -f "$CHECKPOINT" ]]; then
-            CHECKPOINT="$RUN_DIR/circe/cgatr_epoch00.ckpt"
+        CHECKPOINT=""
+        shopt -s nullglob
+        CIRCE_CHECKPOINTS=(
+            "$RUN_DIR"/circe/validation_epoch=0_step=*.ckpt
+        )
+        shopt -u nullglob
+        if [[ "${#CIRCE_CHECKPOINTS[@]}" -gt 0 ]]; then
+            CHECKPOINT="${CIRCE_CHECKPOINTS[0]}"
         fi
         ;;
     gatr)

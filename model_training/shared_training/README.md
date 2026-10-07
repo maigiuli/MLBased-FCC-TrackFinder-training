@@ -33,6 +33,31 @@ All common architecture, optimizer, loss and metric values are environment
 variables in the launcher. The comparison copy is `GATR_CIRCE_LOSS`; `GATR`
 is untouched.
 
+The matched launcher defaults to CIRCE's production recipe for both models:
+16 epochs, `32-true` precision, a 16,000-hit batch budget, AdamW with
+gradient clipping at 1.0, two warmup epochs, validation-loss plateau scheduling
+with patience 3 and factor 0.5, a final six-epoch cosine learning-rate cap,
+40 validation batches per rank, and no step-based checkpoints. Both arms use
+CIRCE's canonical map-style Parquet index and the same global batch plan:
+events are size-bucket shuffled, packed to the shared hit budget, truncated to
+an equal DDP length, and only then divided between ranks. DataLoader workers
+receive already-planned event indices and never independently shard files or
+repack streams. Both loaders call the same
+`shared_training.collation.collate_shared_events` entry point. It dispatches
+only the final model representation: concatenated tensors plus particle
+metadata for CIRCE, or a batched DGL graph plus particle rows for GATr. Only
+the event-to-feature transform is model-specific. Override
+the shared defaults with `TRAIN_PRECISION`, `MAX_TOKENS`, `NUM_EPOCHS`,
+`LIMIT_VAL_BATCHES`, or the other environment variables declared near the top
+of `train_circe_gatr_shared.sh`. Set `MAX_TOKENS=0` to return both models to
+fixed event-count batching through `BATCH_SIZE`.
+
+On this shared path, GATr also follows CIRCE's malformed-input policy: raw hits
+are not deleted during graph construction, stale declared event counts do not
+reject an otherwise readable row, and incomplete optional particle metadata
+does not remove the event. Non-finite model batches are skipped synchronously
+by the common training-step policy on every DDP rank.
+
 Set `LOG_WANDB=1`, and optionally `WANDB_PROJECT` and `WANDB_ENTITY`, to use
 the single shared W&B logger implementation for either model. The logger
 enforces one metric/config schema: identical loss-component, learning-rate,
@@ -46,6 +71,12 @@ implementation and supplies greedy clustering, one-to-one double-majority
 matching, count-weighted fake rate/tracking efficiency, and operating-point
 selection. CIRCE alone turns wire/radius/angle into a full CGA circle; GATr
 continues to turn wire plus left/right positions into its PGA inputs.
+
+After each validation epoch, both comparison arms also upload the same two
+interactive event-0 hit displays to W&B: one coloured by the original MC
+particle ID and one by the reconstructed particle ID at the selected Pareto-F1
+working point. The HTML copies are retained in that epoch's
+`validation_sweeps` directory.
 
 The shared evaluator supports `idea`, `double_majority`, and `hungarian`
 matching. `hungarian` performs a global one-to-one assignment that maximizes

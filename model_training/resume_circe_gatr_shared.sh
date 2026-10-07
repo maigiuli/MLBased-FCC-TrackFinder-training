@@ -4,17 +4,28 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-    echo "Usage: $0 CIRCE|GATR TRAIN_GLOB VAL_GLOB OUTPUT_DIR [GPU_IDS]"
+    echo "Usage: $0 CIRCE|GATR TRAIN_GLOB VAL_GLOB OUTPUT_DIR CHECKPOINT [GPU_IDS]"
     echo "Quote the two globs so the identical file specifications reach both loaders."
+    echo "CHECKPOINT must be a full Lightning checkpoint from the selected model."
 }
-if [[ $# -lt 4 ]]; then usage >&2; exit 2; fi
+if [[ $# -lt 5 || $# -gt 6 ]]; then
+    echo "Expected 5 or 6 arguments; quote TRAIN_GLOB and VAL_GLOB." >&2
+    usage >&2
+    exit 2
+fi
 
 MODEL="${1,,}"
 TRAIN_FILES="$2"
 VAL_FILES="$3"
 OUTPUT_DIR="$4"
-GPU_IDS="${5:-${TRAIN_GPUS:-0}}"
+CHECKPOINT="$5"
+GPU_IDS="${6:-${TRAIN_GPUS:-0}}"
 case "$MODEL" in circe|gatr) ;; *) usage >&2; exit 2 ;; esac
+if [[ ! -f "$CHECKPOINT" ]]; then
+    echo "Checkpoint does not exist: $CHECKPOINT" >&2
+    exit 2
+fi
+CHECKPOINT="$(readlink -f "$CHECKPOINT")"
 if [[ "$TRAIN_FILES" == "$VAL_FILES" ]]; then
     echo "Training and validation specifications must differ." >&2; exit 2
 fi
@@ -112,7 +123,7 @@ run_circe() {
     [[ "$VAL_BATCH_LIMIT" != "-1" ]] && batch_limit_options+=(--limit_val_batches "$VAL_BATCH_LIMIT")
     [[ "$GRAD_CHECKPOINTING" == "1" ]] && checkpoint_options+=(--grad_checkpoint)
     if [[ "$LOG_WANDB" == "1" ]]; then
-        wandb_options=(--log_wandb --wandb_displayname circe_shared)
+        wandb_options=(--log_wandb --wandb_displayname circe_shared_resume)
         [[ -n "$WANDB_PROJECT" ]] && wandb_options+=(--wandb_projectname "$WANDB_PROJECT")
         [[ -n "$WANDB_ENTITY" ]] && wandb_options+=(--wandb_entity "$WANDB_ENTITY")
     fi
@@ -122,7 +133,8 @@ run_circe() {
     cd "$ROOT_DIR/CIRCE"
     "$PYTHON_BIN" src/train.py \
         --train_files "${TRAIN_PATHS[@]}" --val_files "${VAL_PATHS[@]}" \
-        --output_dir "$OUTPUT_DIR/circe" --run_tag circe_shared \
+        --output_dir "$OUTPUT_DIR/circe" --run_tag circe_shared_resume \
+        --resume_ckpt "$CHECKPOINT" \
         --num_epochs "$EPOCHS" --num_devices "$NUM_DEVICES" \
         --batch_size "$BATCH_SIZE" --max_tokens "$MAX_TOKENS" \
         --num_workers "$WORKERS" --prefetch_factor "$PREFETCH" \
@@ -203,6 +215,7 @@ run_gatr() {
         --validation-sweep-max-events "$SWEEP_EVENTS" \
         --sweep-match-metric "$MATCHING_METRIC" --sweep-truth-min-hits 3 \
         --rejected-seed-policy "$REJECTED_POLICY" \
+        --load-model-weights "$CHECKPOINT" --checkpoint-mode resume \
         "${checkpoint_options[@]}" \
         "${wandb_options[@]}"
 }

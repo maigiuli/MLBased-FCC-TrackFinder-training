@@ -17,6 +17,8 @@ import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset
 
+from shared_training.collation import collate_shared_events
+
 DRIFT_DIR_OFFSET = 10
 
 
@@ -27,14 +29,16 @@ def _normalize_time(values):
 
 
 REQUIRED_COLUMNS = (
-    "n_hit", "hit_x_true", "hit_y_true", "hit_z_true", "hit_type",
+    "event_number", "file_number", "n_hit", "n_part",
+    "hit_x_true", "hit_y_true", "hit_z_true", "hit_type",
     "hit_time", "hit_particle_index", "hit_x", "hit_y", "hit_z",
     "leftPosition_x", "leftPosition_y", "leftPosition_z",
     "rightPosition_x", "rightPosition_y", "rightPosition_z",
-    "produced_by_secondary", "drift_distance", "wire_azimuthal_angle",
+    "produced_by_secondary", "overlay", "drift_distance", "wire_azimuthal_angle",
     "wire_stereo_angle", "shared_schema_version",
-    "part_id", "part_p_t", "part_theta", "gen_status",
-    "part_vertex_x", "part_vertex_y",
+    "part_p", "part_p_t", "part_theta", "part_phi", "part_m", "part_pid",
+    "part_id", "gen_status", "part_parent",
+    "part_vertex_x", "part_vertex_y", "part_vertex_z",
 )
 
 
@@ -59,15 +63,12 @@ def _read_row_group(path, row_group):
     return ak.from_arrow(table)
 
 
-class SharedIDEAParquetDataset(Dataset):
-    """Lazy event dataset over the canonical shared CIRCE/GATr files."""
+class SharedParquetEventDataset(Dataset):
+    """Common lazy index over the canonical event-wise Parquet rows."""
 
-    def __init__(self, files, max_hits_per_event=None, with_time=False,
-                 with_drift_dir=False):
+    def __init__(self, files, max_hits_per_event=None):
         self.files = expand_parquet_inputs(files)
         self.max_hits = max_hits_per_event
-        self.with_time = bool(with_time)
-        self.with_drift_dir = bool(with_drift_dir)
         self._index = []
         for path in self.files:
             parquet = pq.ParquetFile(path)
@@ -85,7 +86,7 @@ class SharedIDEAParquetDataset(Dataset):
             raise ValueError("The shared Parquet inputs contain no events")
         sizes = sorted(item[3] for item in self._index)
         print(
-            f"SharedIDEAParquetDataset: {len(self._index)} events from "
+            f"SharedParquetEventDataset: {len(self._index)} events from "
             f"{len(self.files)} files; hits/event min={sizes[0]}, "
             f"median={sizes[len(sizes)//2]}, max={sizes[-1]}", flush=True,
         )
@@ -93,13 +94,30 @@ class SharedIDEAParquetDataset(Dataset):
     def __len__(self):
         return len(self._index)
 
+    def event(self, index):
+        path, row_group, row, _ = self._index[index]
+        return _read_row_group(path, row_group)[row]
+
+    def event_key(self, index):
+        path, row_group, row, _ = self._index[index]
+        return path, row_group, row
+
     @staticmethod
     def _array(event, name, dtype=np.float32):
         return np.asarray(ak.to_numpy(event[name]), dtype=dtype)
 
+
+class SharedIDEAParquetDataset(SharedParquetEventDataset):
+    """CIRCE feature view of the common indexed Parquet events."""
+
+    def __init__(self, files, max_hits_per_event=None, with_time=False,
+                 with_drift_dir=False):
+        super().__init__(files, max_hits_per_event=max_hits_per_event)
+        self.with_time = bool(with_time)
+        self.with_drift_dir = bool(with_drift_dir)
+
     def __getitem__(self, index):
-        path, row_group, row, _ = self._index[index]
-        event = _read_row_group(path, row_group)[row]
+        event = self.event(index)
         hit_type = self._array(event, "hit_type", np.int64)
         # Canonical schema: 1=planar (VTX/Si wrapper), 0=drift chamber.
         vtx_idx = np.flatnonzero(hit_type == 1)
@@ -134,18 +152,24 @@ class SharedIDEAParquetDataset(Dataset):
             dc_geometry = np.column_stack((wire, drift, azimuthal, stereo))
             features[n_vtx:, 4:10] = torch.from_numpy(dc_geometry[dc_idx])
 
+        # Match GATr's display coordinates: measured planar position and the
+        # midpoint of the two drift-circle candidates for chamber hits.
+        left = np.column_stack([
+            self._array(event, name)
+            for name in ("leftPosition_x", "leftPosition_y", "leftPosition_z")
+        ])
+        right = np.column_stack([
+            self._array(event, name)
+            for name in ("rightPosition_x", "rightPosition_y", "rightPosition_z")
+        ])
+        display_positions = np.concatenate(
+            (measured[vtx_idx], 0.5 * (left[dc_idx] + right[dc_idx])), axis=0
+        )
+
         if self.with_time:
             time = torch.from_numpy(self._array(event, "hit_time")[order])
             features[:, 10] = _normalize_time(time)
         if self.with_drift_dir and n_dc:
-            left = np.column_stack([
-                self._array(event, name)
-                for name in ("leftPosition_x", "leftPosition_y", "leftPosition_z")
-            ])
-            right = np.column_stack([
-                self._array(event, name)
-                for name in ("rightPosition_x", "rightPosition_y", "rightPosition_z")
-            ])
             direction = torch.from_numpy(right[dc_idx] - left[dc_idx])
             direction = direction / direction.norm(dim=1, keepdim=True).clamp(min=1e-8)
             offset = DRIFT_DIR_OFFSET + int(self.with_time)
@@ -177,6 +201,7 @@ class SharedIDEAParquetDataset(Dataset):
         }
         return {
             "features": features,
+            "positions": torch.from_numpy(display_positions).float(),
             "mc_index": torch.from_numpy(particle).long(),
             "is_secondary": torch.from_numpy(secondary.astype(np.bool_)),
             "n_hits": len(order),
@@ -186,17 +211,5 @@ class SharedIDEAParquetDataset(Dataset):
         }
 
 
-def collate_idea_events(batch):
-    """Pack variable-size events for CIRCE block-diagonal attention."""
-    batch = [event for event in batch if event is not None]
-    if not batch:
-        return None
-    return {
-        "features": torch.cat([event["features"] for event in batch], dim=0),
-        "mc_index": torch.cat([event["mc_index"] for event in batch], dim=0),
-        "is_secondary": torch.cat(
-            [event["is_secondary"] for event in batch], dim=0
-        ),
-        "seq_lens": [event["n_hits"] for event in batch],
-        "particle_info": [event["particle_info"] for event in batch],
-    }
+# Backward-compatible name for callers outside the matched-training launcher.
+collate_idea_events = collate_shared_events

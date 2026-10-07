@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import math
 import os
 import sys
 from pathlib import Path
@@ -45,6 +46,7 @@ from shared_training.logging_contract import (
 from shared_training.wandb_logger import (
     log_wandb_media, tracking_efficiency_media, wandb_html, wandb_image,
 )
+from shared_training.validation_media import validation_event_media
 from shared_training.tracking_metrics import (
     TRACKING_COUNT_KEYS,
     TRACKING_DISPLACEMENT_BINS,
@@ -59,11 +61,10 @@ from shared_training.tracking_metrics import (
     tracking_metrics_from_counts,
 )
 from src.utils.lr_schedules import (
-    EPOCH_WARMUP_COSINE_UNIT,
     NO_SCHEDULER_UNIT,
     REDUCE_ON_PLATEAU_UNIT,
+    STEP_WARMUP_COSINE_UNIT,
     checkpoint_resume_metadata,
-    epoch_warmup_cosine_factor,
 )
 from src.utils.ema import EMAShadow
 from src.utils.detector_features import (
@@ -133,11 +134,13 @@ class ExampleWrapper(L.LightningModule):
     def __init__(self, args, dev=None):
         super().__init__()
         self.args = args
-        scheduler_name = str(getattr(args, "lr_scheduler", "flat+decay")).lower()
+        scheduler_name = str(
+            getattr(args, "lr_scheduler", "reduceplateau")
+        ).lower()
         if scheduler_name == "none":
             self.lr_schedule_unit = NO_SCHEDULER_UNIT
         elif scheduler_name == "flat+decay":
-            self.lr_schedule_unit = EPOCH_WARMUP_COSINE_UNIT
+            self.lr_schedule_unit = STEP_WARMUP_COSINE_UNIT
         elif scheduler_name == "reduceplateau":
             self.lr_schedule_unit = REDUCE_ON_PLATEAU_UNIT
         else:
@@ -146,6 +149,13 @@ class ExampleWrapper(L.LightningModule):
                 "or reduceplateau"
             )
         self.embedding_dim = int(args.clustering_space_dim)
+        self._steps_per_epoch = int(getattr(args, "steps_per_epoch", 0) or 0)
+        self._base_lr = float(getattr(args, "start_lr", 4e-4))
+        self._min_lr = float(getattr(args, "min_lr", 1e-5))
+        self._warmup_steps = 0
+        self._terminal_anneal_epochs = int(
+            getattr(args, "terminal_anneal_epochs", 6) or 0
+        )
         self.rejected_seed_policy = str(
             getattr(args, "rejected_seed_policy", "discard")
         ).lower()
@@ -190,6 +200,8 @@ class ExampleWrapper(L.LightningModule):
         self.output_dim = self.embedding_dim + 1 + self.helix_proxy_dim
         self.position_scale = float(getattr(args, "position_scale", 1000.0))
         self._val_cache = []
+        self._val_loss_sum = 0.0
+        self._val_loss_event_count = 0
         self._ema: Optional[EMAShadow] = None
         self._ema_decay = float(getattr(args, "ema_decay", 0.0))
         self._ema_restore_state: Optional[Dict[str, torch.Tensor]] = None
@@ -351,6 +363,10 @@ class ExampleWrapper(L.LightningModule):
             return target
         return target * min(1.0, max(0.0, self.current_epoch / warmup))
 
+    def _validation_variance_weight(self):
+        """Use CIRCE's final variance weight for every validation epoch."""
+        return float(getattr(self.args, "var_weight", 0.0))
+
     def _helix_proxy_loss(self, graph, y, prediction):
         """Auxiliary inverse-pT/direction regression using available particle labels."""
         weight = float(getattr(self.args, "helix_loss_weight", 0.0))
@@ -474,7 +490,11 @@ class ExampleWrapper(L.LightningModule):
         graph, _ = batch
         output = self(graph)
         coords, beta_logits, _ = self._split_output(output)
-        variance_weight = self._variance_weight()
+        variance_weight = (
+            self._validation_variance_weight()
+            if stage == "val"
+            else self._variance_weight()
+        )
         batch_ids = torch.repeat_interleave(
             torch.arange(
                 len(graph.batch_num_nodes()), device=output.device,
@@ -515,9 +535,6 @@ class ExampleWrapper(L.LightningModule):
                 )
                 for metric_name, metric_value in loss_metrics.items()
             }
-        else:
-            # Validation is logged only as an epoch aggregate in both models.
-            log_validation_loss(self, loss, batch_size)
         return loss, output
 
     def _nonfinite_batch_details(self, graph, output):
@@ -632,6 +649,27 @@ class ExampleWrapper(L.LightningModule):
         makes ``ema_decay`` an optimizer-step decay, independently of
         ``accumulate_grad_batches``.
         """
+        if str(getattr(self.args, "lr_scheduler", "")).lower() == "reduceplateau":
+            global_step = self.trainer.global_step
+            if self._warmup_steps and global_step < self._warmup_steps:
+                scale = float(global_step + 1) / float(self._warmup_steps)
+                for group in optimizer.param_groups:
+                    group["lr"] = scale * self._base_lr
+            else:
+                terminal_start = int(self.args.num_epochs) - self._terminal_anneal_epochs
+                if self._terminal_anneal_epochs and epoch >= terminal_start:
+                    epoch_fraction = float(batch_idx + 1) / max(
+                        self._steps_per_epoch, 1
+                    )
+                    progress = (
+                        float(epoch) + epoch_fraction - terminal_start
+                    ) / float(self._terminal_anneal_epochs)
+                    progress = min(max(progress, 0.0), 1.0)
+                    cap = self._min_lr + 0.5 * (
+                        self._base_lr - self._min_lr
+                    ) * (1.0 + math.cos(math.pi * progress))
+                    for group in optimizer.param_groups:
+                        group["lr"] = min(float(group["lr"]), cap)
         super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure)
         if self._ema is not None and self._finite_batches_since_optimizer_step > 0:
             self._ema.update(self)
@@ -639,6 +677,8 @@ class ExampleWrapper(L.LightningModule):
 
     def on_validation_epoch_start(self):
         self._val_cache = []
+        self._val_loss_sum = 0.0
+        self._val_loss_event_count = 0
         self._validation_working_points = None
         self._initialize_ema_if_needed()
         if self._ema is not None:
@@ -840,87 +880,13 @@ class ExampleWrapper(L.LightningModule):
 
     def _first_validation_event_media(self, event, working_point, output_dir=None):
         """Build detector- and embedding-space media for the first event."""
-        from shared_training.tracking_metrics import greedy_cluster
-        reco_labels = greedy_cluster(
-            event["beta"],
-            event["coords"],
-            float(working_point["tbeta"]),
-            float(working_point["td"]),
-            int(working_point["min_hits"]),
+        html_payloads = validation_event_media(
+            event,
+            working_point,
             rejected_seed_policy=self.rejected_seed_policy,
+            output_dir=output_dir,
+            include_embedding=True,
         )
-        hits_mc_fig = self._validation_scatter_figure(
-            event["positions"],
-            event["mc_particle_id"],
-            "MC particle index",
-            "Validation event 0: hits coloured by MC particle index",
-            ("x", "y", "z"),
-        )
-        hits_reco_fig = self._validation_scatter_figure(
-            event["positions"],
-            reco_labels,
-            "Reconstructed particle index",
-            "Validation event 0: hits coloured by reconstructed index",
-            ("x", "y", "z"),
-        )
-        embedding_points, embedding_axes, embedding_description = (
-            self._embedding_plot_coordinates(event["coords"])
-        )
-        embedding_mc_fig = self._validation_scatter_figure(
-            embedding_points,
-            event["mc_particle_id"],
-            "MC particle index",
-            (
-                "Validation event 0: embedding coloured by MC particle index "
-                f"({embedding_description})"
-            ),
-            embedding_axes,
-        )
-        embedding_reco_fig = self._validation_scatter_figure(
-            embedding_points,
-            reco_labels,
-            "Reconstructed particle index",
-            (
-                "Validation event 0: embedding coloured by reconstructed index "
-                f"({embedding_description})"
-            ),
-            embedding_axes,
-        )
-        html_payloads = {
-            "plots/validation_event_0/hits_by_mc_particle": hits_mc_fig.to_html(
-                full_html=False, include_plotlyjs="cdn"
-            ),
-            "plots/validation_event_0/hits_by_reconstructed_particle": (
-                hits_reco_fig.to_html(full_html=False, include_plotlyjs="cdn")
-            ),
-            "plots/validation_event_0/embedding_by_mc_particle": (
-                embedding_mc_fig.to_html(full_html=False, include_plotlyjs="cdn")
-            ),
-            "plots/validation_event_0/embedding_by_reconstructed_particle": (
-                embedding_reco_fig.to_html(full_html=False, include_plotlyjs="cdn")
-            ),
-        }
-        if output_dir is not None:
-            output_dir = Path(output_dir)
-            output_dir.mkdir(parents=True, exist_ok=True)
-            output_names = {
-                "plots/validation_event_0/hits_by_mc_particle": (
-                    "validation_event_0_hits_by_mc_particle.html"
-                ),
-                "plots/validation_event_0/hits_by_reconstructed_particle": (
-                    "validation_event_0_hits_by_reconstructed_particle.html"
-                ),
-                "plots/validation_event_0/embedding_by_mc_particle": (
-                    "validation_event_0_embedding_by_mc_particle.html"
-                ),
-                "plots/validation_event_0/embedding_by_reconstructed_particle": (
-                    "validation_event_0_embedding_by_reconstructed_particle.html"
-                ),
-            }
-            for key, filename in output_names.items():
-                (output_dir / filename).write_text(html_payloads[key])
-        # Html preserves Plotly's interactive legend, allowing individual
-        # particle traces to be toggled in the W&B run page.
         return {key: wandb_html(html) for key, html in html_payloads.items()}
 
     def _local_validation_sweep_events(self):
@@ -934,11 +900,27 @@ class ExampleWrapper(L.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         loss, output = self._shared_step(batch, "val")
+        if torch.isfinite(loss):
+            n_events = len(batch[0].batch_num_nodes())
+            self._val_loss_sum += float(loss.item()) * n_events
+            self._val_loss_event_count += n_events
         if not self.trainer.sanity_checking:
             self._cache_validation_output(batch[0], batch[1], output)
         return loss
 
     def on_validation_epoch_end(self):
+        reduction_device = next(self.parameters()).device
+        loss_stats = torch.tensor(
+            [self._val_loss_sum, self._val_loss_event_count],
+            dtype=torch.float64,
+            device=reduction_device,
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(loss_stats, op=dist.ReduceOp.SUM)
+        global_loss_sum, global_event_count = loss_stats.tolist()
+        validation_loss = global_loss_sum / max(global_event_count, 1.0)
+        log_validation_loss(self, validation_loss, batch_size=1)
+
         if not self.trainer.sanity_checking:
             # Collect every image/HTML object and send one W&B history row per
             # validation pass.  Separate logger.log_image() calls each commit a
@@ -968,7 +950,6 @@ class ExampleWrapper(L.LightningModule):
             # Each rank evaluates only its local events.  Only the additive raw
             # counts are reduced, so global rates retain their correct event
             # weighting without gathering embeddings or predictions to rank 0.
-            reduction_device = next(self.parameters()).device
             count_tensor = torch.tensor(
                 [
                     [row[key] for key in TRACKING_COUNT_KEYS]
@@ -1013,7 +994,7 @@ class ExampleWrapper(L.LightningModule):
                     "repulsive_weight": float(self.args.L_repulsive_weight),
                     "beta_suppress_weight": float(self.args.beta_suppress_weight),
                     "beta_second_weight": float(self.args.beta_second_weight),
-                    "variance_weight": self._variance_weight(),
+                    "variance_weight": self._validation_variance_weight(),
                     "helix_loss_weight": float(self.args.helix_loss_weight),
                     "hard_negative_weight": float(self.args.hard_negative_weight),
                     "pt_track_weighting": self.pt_track_weighting,
@@ -1362,6 +1343,9 @@ class ExampleWrapper(L.LightningModule):
         for key, value in getattr(self.args, "optimizer_option", []):
             options[key] = ast.literal_eval(value)
         options.setdefault("weight_decay", float(getattr(self.args, "weight_decay", 1e-4)))
+        options.setdefault(
+            "fused", str(getattr(self.args, "precision", "32-true")) == "32-true"
+        )
         start_lr = float(self.args.start_lr)
         if start_lr <= 0:
             raise ValueError("--start-lr must be greater than zero")
@@ -1375,24 +1359,45 @@ class ExampleWrapper(L.LightningModule):
         else:
             raise ValueError("Lightning GATr supports optimizer adamW, adam, or radam")
 
-        scheduler_name = str(getattr(self.args, "lr_scheduler", "flat+decay")).lower()
+        scheduler_name = str(
+            getattr(self.args, "lr_scheduler", "reduceplateau")
+        ).lower()
         if scheduler_name == "none":
             return optimizer
+        if self._steps_per_epoch <= 0:
+            estimated = self.trainer.estimated_stepping_batches
+            if not math.isfinite(float(estimated)):
+                raise RuntimeError(
+                    f"{scheduler_name} requires --steps-per-epoch when the "
+                    "training loader has no finite length"
+                )
+            self._steps_per_epoch = int(
+                estimated // max(int(self.args.num_epochs), 1)
+            )
+        if self._steps_per_epoch <= 0:
+            raise RuntimeError(
+                f"{scheduler_name} requires a finite steps-per-epoch"
+            )
+
         if scheduler_name == "reduceplateau":
+            self._warmup_steps = int(
+                float(getattr(self.args, "warmup_epochs", 2.0))
+                * self._steps_per_epoch
+            )
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer,
-                mode="max",
+                mode="min",
                 factor=float(getattr(self.args, "plateau_factor", 0.5)),
-                patience=int(getattr(self.args, "plateau_patience", 2)),
-                threshold=float(getattr(self.args, "plateau_threshold", 1e-3)),
+                patience=int(getattr(self.args, "plateau_patience", 3)),
+                threshold=float(getattr(self.args, "plateau_threshold", 1e-4)),
                 threshold_mode="rel",
-                min_lr=float(getattr(self.args, "min_lr", 1e-6)),
+                min_lr=self._min_lr,
             )
             return {
                 "optimizer": optimizer,
                 "lr_scheduler": {
                     "scheduler": scheduler,
-                    "monitor": "val_pareto_f1",
+                    "monitor": "validation/loss",
                     "interval": "epoch",
                     "frequency": 1,
                     "strict": True,
@@ -1404,13 +1409,22 @@ class ExampleWrapper(L.LightningModule):
                 "or reduceplateau"
             )
 
-        total_epochs = max(int(self.args.num_epochs), 1)
-        warmup_epochs = float(getattr(self.args, "warmup_epochs", 2.0))
+        total_steps = max(int(self.args.num_epochs), 1) * self._steps_per_epoch
+        warmup_steps = int(
+            float(getattr(self.args, "warmup_epochs", 2.0))
+            * self._steps_per_epoch
+        )
         min_ratio = float(getattr(self.args, "min_lr", 1e-6)) / start_lr
 
-        def schedule(epoch):
-            return epoch_warmup_cosine_factor(
-                epoch, total_epochs, warmup_epochs, min_ratio
+        def schedule(step):
+            if step < warmup_steps:
+                return step / max(warmup_steps, 1)
+            progress = (step - warmup_steps) / max(
+                total_steps - warmup_steps, 1
+            )
+            return max(
+                min_ratio,
+                0.5 * (1.0 + math.cos(math.pi * progress)),
             )
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
@@ -1418,7 +1432,7 @@ class ExampleWrapper(L.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": "epoch",
+                "interval": "step",
                 "frequency": 1,
             },
         }
