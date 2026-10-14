@@ -39,16 +39,19 @@ if _LOADED_GATR_PACKAGE != _EXPECTED_GATR_PACKAGE:
 GATR_BACKEND = f"gatr_v142 (package version {_gatr_package.__version__})"
 from src.layers.batch_operations import obtain_batch_numbers
 from src.layers.losses import object_condensation_loss_tracking
-from src.layers.tracking_metrics import (
+from src.layers.tracking_metrics_backup import (
     TRACKING_COUNT_KEYS,
     TRACKING_DISPLACEMENT_BINS,
     TRACKING_PT_BINS,
+    TRACKING_THETA_BINS,
     parse_grid,
     run_operating_point_sweep,
     save_tracking_efficiency_displacement_plot,
     save_tracking_efficiency_pt_plot,
     save_sweep_results,
     tracking_efficiency_binned_counts,
+    tracking_efficiency_theta_counts,
+    save_tracking_efficiency_theta_plot,
     tracking_metrics_from_counts,
 )
 from src.utils.lr_schedules import (
@@ -1185,6 +1188,7 @@ class ExampleWrapper(L.LightningModule):
                 # over DDP ranks without gathering hit embeddings.
                 pt_count_rows = []
                 displacement_count_rows = []
+                theta_count_rows = []
                 missing_info = {"pt": 0, "displacement": 0}
                 for name in ("max_efficiency", "pareto_f1"):
                     working_point = working_points[name]
@@ -1196,6 +1200,7 @@ class ExampleWrapper(L.LightningModule):
                         {
                             "pt": TRACKING_PT_BINS,
                             "displacement": TRACKING_DISPLACEMENT_BINS,
+                            "theta_deg": TRACKING_THETA_BINS,
                         },
                         metric=self.args.sweep_match_metric,
                         truth_min_hits=int(self.args.sweep_truth_min_hits),
@@ -1204,6 +1209,9 @@ class ExampleWrapper(L.LightningModule):
                         gen_status=(0, 1),
                         rejected_seed_policy=self.rejected_seed_policy,
                     )
+
+                    theta_total, theta_matched = binned_counts["theta_deg"]
+                    theta_count_rows.extend((theta_total, theta_matched))
                     pt_total, pt_matched = binned_counts["pt"]
                     displacement_total, displacement_matched = binned_counts[
                         "displacement"
@@ -1226,6 +1234,11 @@ class ExampleWrapper(L.LightningModule):
                     dtype=torch.int64,
                     device=reduction_device,
                 )
+                theta_count_tensor = torch.tensor(
+                    np.stack(theta_count_rows, axis=0),
+                    dtype=torch.int64,
+                    device=reduction_device,
+                )
                 missing_tensor = torch.tensor(
                     [missing_info["pt"], missing_info["displacement"]],
                     dtype=torch.int64,
@@ -1237,6 +1250,7 @@ class ExampleWrapper(L.LightningModule):
                 if dist.is_available() and dist.is_initialized():
                     dist.all_reduce(pt_count_tensor, op=dist.ReduceOp.SUM)
                     dist.all_reduce(displacement_count_tensor, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(theta_count_tensor, op=dist.ReduceOp.SUM)
                     dist.all_reduce(missing_tensor, op=dist.ReduceOp.SUM)
                     dist.all_reduce(pt_event_count, op=dist.ReduceOp.SUM)
 
@@ -1255,8 +1269,23 @@ class ExampleWrapper(L.LightningModule):
                             pt_count_tensor[3],
                         ),
                     )
+                    theta_plot_specs = (
+                        (
+                            "max_efficiency",
+                            "GGTF: max. efficiency",
+                            theta_count_tensor[0],
+                            theta_count_tensor[1],
+                        ),
+                        (
+                            "pareto_f1",
+                            "GGTF: Pareto F1",
+                            theta_count_tensor[2],
+                            theta_count_tensor[3],
+                        ),
+                    )
                     pt_image_paths = {}
                     displacement_image_paths = {}
+                    theta_image_paths = {}
                     for name, label, total_counts, matched_counts in plot_specs:
                         pt_image_paths[name] = save_tracking_efficiency_pt_plot(
                             [
@@ -1276,6 +1305,22 @@ class ExampleWrapper(L.LightningModule):
                             max_theta=170.0,
                             gen_status=(0, 1),
                         )
+
+                    for name, label, total_counts, matched_counts in theta_plot_specs:
+                        theta_image_paths[name] = save_tracking_efficiency_theta_plot(
+                            [
+                                {
+                                    "name": name,
+                                    "label": label,
+                                    "total": total_counts.cpu().numpy(),
+                                    "matched": matched_counts.cpu().numpy(),
+                                }
+                            ],
+                            str(output_dir),
+                            filename_stem=f"tracking_efficiency_vs_theta_{name}",
+                            bins=TRACKING_THETA_BINS,
+                        )
+
                     displacement_plot_specs = (
                         (
                             "max_efficiency",
@@ -1335,12 +1380,18 @@ class ExampleWrapper(L.LightningModule):
                                 wandb_media[
                                     f"plots/tracking_efficiency_vs_pt/{name}"
                                 ] = wandb.Image(str(image_path))
+                        for name, image_path in theta_image_paths.items():
+                            if image_path is not None:
+                                wandb_media[
+                                    f"plots/tracking_efficiency_vs_theta/{name}"
+                                ] = wandb.Image(str(image_path))
                         for name, image_path in displacement_image_paths.items():
                             if image_path is not None:
                                 wandb_media[
                                     "plots/tracking_efficiency_vs_displacement/"
                                     f"{name}"
                                 ] = wandb.Image(str(image_path))
+
 
             if (
                 self.trainer.is_global_zero
