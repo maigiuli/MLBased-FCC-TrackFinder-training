@@ -39,8 +39,10 @@ if _LOADED_GATR_PACKAGE != _EXPECTED_GATR_PACKAGE:
 
 GATR_BACKEND = f"gatr_v142 (package version {_gatr_package.__version__})"
 from src.layers.batch_operations import obtain_batch_numbers
+from shared_training.checkpoint_resume import reset_validation_loop_progress
 from shared_training.circe_loss import object_condensation_loss
 from shared_training.logging_contract import (
+    HELIX_TRAIN_METRIC_NAMES, HELIX_VALIDATION_LOSS_NAME,
     log_sweep_metrics, log_training_metrics, log_validation_loss,
 )
 from shared_training.wandb_logger import (
@@ -487,9 +489,9 @@ class ExampleWrapper(L.LightningModule):
         return loss_sum / normalizer
 
     def _shared_step(self, batch, stage):
-        graph, _ = batch
+        graph, y = batch
         output = self(graph)
-        coords, beta_logits, _ = self._split_output(output)
+        coords, beta_logits, helix_prediction = self._split_output(output)
         variance_weight = (
             self._validation_variance_weight()
             if stage == "val"
@@ -517,6 +519,16 @@ class ExampleWrapper(L.LightningModule):
             oc_mode="paper_hinge",
         )
         batch_size = len(graph.batch_num_nodes())
+        # ``loss`` stays the object-condensation loss shared with CIRCE (it is
+        # logged under the common keys and drives validation/loss); the
+        # optional helix regression is added only to the optimized objective.
+        total_loss = loss
+        helix_loss = None
+        if self._use_helix_proxy:
+            helix_loss = self._helix_proxy_loss(
+                graph, y, helix_prediction.float()
+            )
+            total_loss = loss + float(self.args.helix_loss_weight) * helix_loss
         if stage == "train":
             loss_metrics = log_training_metrics(
                 self,
@@ -527,6 +539,24 @@ class ExampleWrapper(L.LightningModule):
                 variance_weight,
                 batch_size,
             )
+            if helix_loss is not None:
+                helix_metrics = {
+                    HELIX_TRAIN_METRIC_NAMES["helix"]: helix_loss,
+                    HELIX_TRAIN_METRIC_NAMES["helix_weighted"]: (
+                        float(self.args.helix_loss_weight) * helix_loss
+                    ),
+                    HELIX_TRAIN_METRIC_NAMES["total"]: total_loss,
+                }
+                for metric_name, metric_value in helix_metrics.items():
+                    self.log(
+                        metric_name,
+                        metric_value,
+                        on_step=True,
+                        on_epoch=True,
+                        sync_dist=True,
+                        batch_size=batch_size,
+                    )
+                loss_metrics = {**loss_metrics, **helix_metrics}
             self._latest_loss_metrics = {
                 metric_name: (
                     metric_value.detach()
@@ -535,6 +565,16 @@ class ExampleWrapper(L.LightningModule):
                 )
                 for metric_name, metric_value in loss_metrics.items()
             }
+            return total_loss, output
+        if helix_loss is not None:
+            self.log(
+                HELIX_VALIDATION_LOSS_NAME,
+                helix_loss,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=batch_size,
+            )
         return loss, output
 
     def _nonfinite_batch_details(self, graph, output):
@@ -1167,7 +1207,8 @@ class ExampleWrapper(L.LightningModule):
                     for name in ("max_efficiency", "pareto_f1"):
                         pt_image_paths[name] = save_tracking_efficiency_pt_plot(
                             matching_comparison_plot_series(
-                                comparison_order, pt_counts, name
+                                comparison_order, pt_counts, name,
+                                working_point=working_points[name],
                             ),
                             str(output_dir),
                             filename_stem=f"tracking_efficiency_vs_pt_{name}",
@@ -1177,6 +1218,7 @@ class ExampleWrapper(L.LightningModule):
                             min_theta=10.0,
                             max_theta=170.0,
                             gen_status=(0, 1),
+                            truth_min_hits=int(self.args.sweep_truth_min_hits),
                         )
                         displacement_image_paths[name] = (
                             save_tracking_efficiency_displacement_plot(
@@ -1184,6 +1226,7 @@ class ExampleWrapper(L.LightningModule):
                                     comparison_order,
                                     displacement_counts,
                                     name,
+                                    working_point=working_points[name],
                                 ),
                                 str(output_dir),
                                 filename_stem=(
@@ -1195,6 +1238,9 @@ class ExampleWrapper(L.LightningModule):
                                 min_theta=10.0,
                                 max_theta=170.0,
                                 gen_status=(0, 1),
+                                truth_min_hits=int(
+                                    self.args.sweep_truth_min_hits
+                                ),
                             )
                         )
                     print(
@@ -1321,6 +1367,11 @@ class ExampleWrapper(L.LightningModule):
             }
 
     def on_load_checkpoint(self, checkpoint):
+        if reset_validation_loop_progress(checkpoint):
+            print(
+                "Resume: the next validation runs every validation batch.",
+                flush=True,
+            )
         if "ema_state_dict" in checkpoint:
             if self._ema is not None:
                 self._ema.load_state_dict(checkpoint["ema_state_dict"])

@@ -17,14 +17,33 @@ TRAIN_METRIC_NAMES = {
 
 VALIDATION_LOSS_NAME = "validation/loss"
 
+# Optional GATr-only auxiliary helix regression (``--helix-loss-weight > 0``).
+# CIRCE never logs these, so they do not affect the matched comparison keys.
+HELIX_TRAIN_METRIC_NAMES = {
+    "helix": "train/loss_helix",
+    "helix_weighted": "train/loss_helix_weighted",
+    "total": "train/loss_total",
+}
+HELIX_VALIDATION_LOSS_NAME = "validation/loss_helix"
+
 SWEEP_METRIC_NAMES = {
     "pareto_f1": "validation/pareto_f1",
     "pareto_fake_rate": "validation/fake_rate_at_pareto_f1",
+    "pareto_fake_rate_double_majority": (
+        "validation/fake_rate_double_majority_at_pareto_f1"
+    ),
+    "pareto_fake_rate_hungarian": "validation/fake_rate_hungarian_at_pareto_f1",
     "pareto_efficiency": "validation/tracking_efficiency_at_pareto_f1",
     "pareto_tbeta": "validation/pareto_f1_tbeta",
     "pareto_td": "validation/pareto_f1_td",
     "max_efficiency": "validation/max_tracking_efficiency",
     "max_efficiency_fake_rate": "validation/fake_rate_at_max_efficiency",
+    "max_efficiency_fake_rate_double_majority": (
+        "validation/fake_rate_double_majority_at_max_efficiency"
+    ),
+    "max_efficiency_fake_rate_hungarian": (
+        "validation/fake_rate_hungarian_at_max_efficiency"
+    ),
     "max_efficiency_f1": "validation/f1_at_max_efficiency",
     "max_efficiency_tbeta": "validation/max_efficiency_tbeta",
     "max_efficiency_td": "validation/max_efficiency_td",
@@ -106,11 +125,23 @@ def sweep_metric_values(working_points):
     return {
         SWEEP_METRIC_NAMES["pareto_f1"]: pareto["f1"],
         SWEEP_METRIC_NAMES["pareto_fake_rate"]: pareto["fake_rate"],
+        SWEEP_METRIC_NAMES["pareto_fake_rate_double_majority"]: (
+            pareto["fake_rate_double_majority"]
+        ),
+        SWEEP_METRIC_NAMES["pareto_fake_rate_hungarian"]: (
+            pareto["fake_rate_hungarian"]
+        ),
         SWEEP_METRIC_NAMES["pareto_efficiency"]: pareto["efficiency"],
         SWEEP_METRIC_NAMES["pareto_tbeta"]: pareto["tbeta"],
         SWEEP_METRIC_NAMES["pareto_td"]: pareto["td"],
         SWEEP_METRIC_NAMES["max_efficiency"]: maximum["efficiency"],
         SWEEP_METRIC_NAMES["max_efficiency_fake_rate"]: maximum["fake_rate"],
+        SWEEP_METRIC_NAMES["max_efficiency_fake_rate_double_majority"]: (
+            maximum["fake_rate_double_majority"]
+        ),
+        SWEEP_METRIC_NAMES["max_efficiency_fake_rate_hungarian"]: (
+            maximum["fake_rate_hungarian"]
+        ),
         SWEEP_METRIC_NAMES["max_efficiency_f1"]: maximum["f1"],
         SWEEP_METRIC_NAMES["max_efficiency_tbeta"]: maximum["tbeta"],
         SWEEP_METRIC_NAMES["max_efficiency_td"]: maximum["td"],
@@ -133,8 +164,12 @@ def allowed_wandb_metric(name):
     """Whether a scalar key belongs to the matched comparison contract."""
     if name in ("epoch", "trainer/global_step"):
         return True
-    bases = set(TRAIN_METRIC_NAMES.values())
-    if name in bases or name in {VALIDATION_LOSS_NAME, *SWEEP_METRIC_NAMES.values()}:
+    bases = {*TRAIN_METRIC_NAMES.values(), *HELIX_TRAIN_METRIC_NAMES.values()}
+    if name in bases or name in {
+        VALIDATION_LOSS_NAME,
+        HELIX_VALIDATION_LOSS_NAME,
+        *SWEEP_METRIC_NAMES.values(),
+    }:
         return True
     return any(name == f"{base}_{suffix}" for base in bases for suffix in ("step", "epoch"))
 
