@@ -12,7 +12,7 @@ import math
 import torch
 import warnings
 import random
-from src.models.Gatr_withModifications import ExampleWrapper
+from src.models.Gatr_withModifications_backup import ExampleWrapper
 from src.utils.detector_features import validate_layers_per_superlayer
 
 from torch.utils.data import DataLoader

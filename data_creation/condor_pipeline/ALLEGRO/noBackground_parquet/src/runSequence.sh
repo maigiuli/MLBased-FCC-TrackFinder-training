@@ -41,7 +41,7 @@ rm Zcard_${SEED}.cmd
 if [[ "${TRAIN_OR_TEST}" == "train" ]]
 then
       
-      ddsim --compactFile $K4GEO/FCCee/ALLEGRO/compact/ALLEGRO_o1_v04/ALLEGRO_o1_v04.xml \
+      ddsim --compactFile $K4GEO/FCCee/ALLEGRO/compact/ALLEGRO_o1_v03/ALLEGRO_o1_v03.xml \
             --outputFile out_sim_edm4hep_${SEED}.root \
             --inputFiles out_${SEED}.hepmc \
             --numberOfEvents $NEV \
@@ -52,7 +52,7 @@ fi
 if [[ "${TRAIN_OR_TEST}" == "test" ]]
 then
 
-      ddsim --compactFile $K4GEO/FCCee/ALLEGRO/compact/ALLEGRO_o1_v04/ALLEGRO_o1_v04.xml \
+      ddsim --compactFile $K4GEO/FCCee/ALLEGRO/compact/ALLEGRO_o1_v03/ALLEGRO_o1_v03.xml \
             --outputFile out_sim_edm4hep_${SEED}.root \
             --inputFiles out_${SEED}.hepmc \
             --numberOfEvents $NEV \
