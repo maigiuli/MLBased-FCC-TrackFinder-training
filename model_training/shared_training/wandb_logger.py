@@ -146,6 +146,9 @@ def tracking_efficiency_media(pt_paths, displacement_paths, theta_paths=None):
     for name, path in pt_paths.items():
         if path is not None and Path(path).is_file():
             media[f"plots/tracking_efficiency_vs_pt/{name}"] = wandb_image(path)
+    for name, path in theta_paths.items():
+        if path is not None and Path(path).is_file():
+            media[f"plots/tracking_efficiency_vs_theta/{name}"] = wandb_image(path)
     for name, path in displacement_paths.items():
         if path is not None and Path(path).is_file():
             media[

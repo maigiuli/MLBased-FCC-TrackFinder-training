@@ -364,16 +364,20 @@ def tracking_efficiency_binned_counts(
                 value = theta_degrees if name == "theta" else float(info[name])
                 if not np.isfinite(value) or value < 0:
                     continue
-                # Include an entry exactly on the upper boundary in the final
-                # bin, so the documented 0--2000 mm range is closed at 2000.
+
+                # Include an entry exactly on the upper boundary in the final bin.
                 if value == bins[-1]:
                     bin_index = bins.size - 2
                 else:
                     bin_index = int(np.searchsorted(bins, value, side="right") - 1)
+
                 total, matched = counts[name]
+
                 if bin_index < 0 or bin_index >= total.size:
                     continue
+
                 total[bin_index] += 1
+
                 if int(truth_id) in matched_truth_ids:
                     matched[bin_index] += 1
 
@@ -409,7 +413,40 @@ def tracking_efficiency_pt_counts(
     )
     return counts["pt"][0], counts["pt"][1], missing["pt"]
 
+def tracking_efficiency_theta_counts(
+    events: Sequence[Dict[str, np.ndarray]],
+    tbeta: float,
+    td: float,
+    min_hits: int,
+    bins: np.ndarray = TRACKING_THETA_BINS,
+    metric: str = "double_majority",
+    truth_min_hits: int = 3,
+    min_theta: float = 10.0,
+    max_theta: float = 170.0,
+    gen_status: Sequence[int] = (0, 1),
+    rejected_seed_policy: str = "discard",
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Count total and matched selected truth tracks in theta bins."""
 
+    counts, missing = tracking_efficiency_binned_counts(
+        events,
+        tbeta,
+        td,
+        min_hits,
+        {"theta": bins},
+        metric=metric,
+        truth_min_hits=truth_min_hits,
+        min_theta=min_theta,
+        max_theta=max_theta,
+        gen_status=gen_status,
+        rejected_seed_policy=rejected_seed_policy,
+    )
+
+    return (
+        counts["theta"][0],
+        counts["theta"][1],
+        missing["theta"],
+    )
 def matching_comparison_binned_counts(
     events: Sequence[Dict[str, np.ndarray]],
     working_points: Dict[str, Dict[str, float]],
@@ -650,7 +687,9 @@ def save_tracking_efficiency_pt_plot(
         ax.set_ylim([0.01, 1.01])
         ax.legend(loc="lower right", fontsize=17)
         if _log_x:
-            ax.xaxis.set_major_locator(plt.LogLocator(base=10.0, numticks=4))
+            ax.xaxis.set_major_locator(
+                plt.LogLocator(base=10.0, numticks=4)
+            )
             ax.xaxis.set_minor_locator(
                 plt.LogLocator(base=10.0, subs="auto", numticks=10)
             )
@@ -725,8 +764,21 @@ def save_tracking_efficiency_displacement_plot(
         # text compact and between the data and the legend.
         _text_y=0.40,
         _text_size=15,
+        _major_tick_locator=500.0,
+        _minor_tick_locator=50.0,
     )
 
+def save_tracking_efficiency_theta_plot(
+    series: Sequence[Dict],
+    output_dir: str,
+    filename_stem: str = "tracking_efficiency_vs_theta",
+    bins: np.ndarray = TRACKING_THETA_BINS,
+    min_theta: float = 10.0,
+    max_theta: float = 170.0,
+    gen_status: Sequence[int] = (0, 1),
+    truth_min_hits: int = 3,
+):
+    """Save efficiency versus polar angle theta."""
 
 def save_tracking_efficiency_theta_plot(
     series: Sequence[Dict],

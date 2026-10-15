@@ -38,8 +38,17 @@ if _LOADED_GATR_PACKAGE != _EXPECTED_GATR_PACKAGE:
 
 GATR_BACKEND = f"gatr_v142 (package version {_gatr_package.__version__})"
 from src.layers.batch_operations import obtain_batch_numbers
-from src.layers.losses import object_condensation_loss_tracking
-from src.layers.tracking_metrics_backup import (
+from shared_training.checkpoint_resume import reset_validation_loop_progress
+from shared_training.circe_loss import object_condensation_loss
+from shared_training.logging_contract import (
+    HELIX_TRAIN_METRIC_NAMES, HELIX_VALIDATION_LOSS_NAME,
+    log_sweep_metrics, log_training_metrics, log_validation_loss,
+)
+from shared_training.wandb_logger import (
+    log_wandb_media, tracking_efficiency_media, wandb_html, wandb_image,
+)
+from shared_training.validation_media import validation_event_media
+from src.layers.tracking_metrics import (
     TRACKING_COUNT_KEYS,
     TRACKING_DISPLACEMENT_BINS,
     TRACKING_PT_BINS,
