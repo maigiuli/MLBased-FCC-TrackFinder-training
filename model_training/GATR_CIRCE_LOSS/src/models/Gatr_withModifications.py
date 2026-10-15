@@ -53,11 +53,13 @@ from shared_training.tracking_metrics import (
     TRACKING_COUNT_KEYS,
     TRACKING_DISPLACEMENT_BINS,
     TRACKING_PT_BINS,
+    TRACKING_THETA_BINS,
     matching_comparison_binned_counts,
     matching_comparison_plot_series,
     parse_grid,
     run_operating_point_sweep,
     save_tracking_efficiency_displacement_plot,
+    save_tracking_efficiency_theta_plot, 
     save_tracking_efficiency_pt_plot,
     save_sweep_results,
     tracking_metrics_from_counts,
@@ -1160,6 +1162,7 @@ class ExampleWrapper(L.LightningModule):
                         working_points,
                         {
                             "pt": TRACKING_PT_BINS,
+                            "theta": TRACKING_THETA_BINS,
                             "displacement": TRACKING_DISPLACEMENT_BINS,
                         },
                         truth_min_hits=int(self.args.sweep_truth_min_hits),
@@ -1177,6 +1180,18 @@ class ExampleWrapper(L.LightningModule):
                     dtype=torch.int64,
                     device=reduction_device,
                 )
+                theta_count_tensor = torch.tensor(
+                    np.stack(
+                        [
+                            np.stack(pair, axis=0)
+                            for pair in comparison_rows["theta"]
+                        ],
+                        axis=0,
+                    ),
+                    dtype=torch.int64,
+                    device=reduction_device,
+                )
+
                 displacement_count_tensor = torch.tensor(
                     np.stack([
                         np.stack(pair, axis=0)
@@ -1186,7 +1201,11 @@ class ExampleWrapper(L.LightningModule):
                     device=reduction_device,
                 )
                 missing_tensor = torch.tensor(
-                    [missing_info["pt"], missing_info["displacement"]],
+                    [
+                        missing_info["pt"],
+                        missing_info["theta"],
+                        missing_info["displacement"],
+                    ],
                     dtype=torch.int64,
                     device=reduction_device,
                 )
@@ -1195,14 +1214,17 @@ class ExampleWrapper(L.LightningModule):
                 )
                 if dist.is_available() and dist.is_initialized():
                     dist.all_reduce(pt_count_tensor, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(theta_count_tensor, op=dist.ReduceOp.SUM)
                     dist.all_reduce(displacement_count_tensor, op=dist.ReduceOp.SUM)
                     dist.all_reduce(missing_tensor, op=dist.ReduceOp.SUM)
                     dist.all_reduce(pt_event_count, op=dist.ReduceOp.SUM)
 
                 if self.trainer.is_global_zero:
                     pt_image_paths = {}
+                    theta_image_paths = {}
                     displacement_image_paths = {}
                     pt_counts = pt_count_tensor.cpu().numpy()
+                    theta_counts = theta_count_tensor.cpu().numpy()
                     displacement_counts = displacement_count_tensor.cpu().numpy()
                     for name in ("max_efficiency", "pareto_f1"):
                         pt_image_paths[name] = save_tracking_efficiency_pt_plot(
@@ -1215,6 +1237,21 @@ class ExampleWrapper(L.LightningModule):
                             bins=TRACKING_PT_BINS,
                             min_x=0.1,
                             max_x=60.0,
+                            min_theta=10.0,
+                            max_theta=170.0,
+                            gen_status=(0, 1),
+                            truth_min_hits=int(self.args.sweep_truth_min_hits),
+                        )
+                        theta_image_paths[name] = save_tracking_efficiency_theta_plot(
+                            matching_comparison_plot_series(
+                                comparison_order,
+                                theta_counts,
+                                name,
+                                working_point=working_points[name],
+                            ),
+                            str(output_dir),
+                            filename_stem=f"tracking_efficiency_vs_theta_{name}",
+                            bins=TRACKING_THETA_BINS,
                             min_theta=10.0,
                             max_theta=170.0,
                             gen_status=(0, 1),
@@ -1245,17 +1282,26 @@ class ExampleWrapper(L.LightningModule):
                         )
                     print(
                         "Saved double-majority and Hungarian tracking "
-                        "efficiency versus pT and uniformly binned "
+                        "efficiency versus pT, theta and uniformly binned "
                         "displacement from "
                         f"{int(pt_event_count.item())} validation events; "
-                        "missing pT/displacement metadata for "
+                        "missing pt/theta/displacement metadata for "
                         f"{int(missing_tensor[0].item())}/"
-                        f"{int(missing_tensor[1].item())} eligible truth tracks.",
+                        f"{int(missing_tensor[1].item())}/"
+                        f"{int(missing_tensor[2].item())} eligible truth tracks.",
                         flush=True,
                     )
                     if hasattr(self.logger, "log_image"):
+                        print("PT")
+                        print(pt_image_paths)
+
+                        print("THETA")
+                        print(theta_image_paths)
+
+                        print("DISP")
+                        print(displacement_image_paths)
                         wandb_media.update(tracking_efficiency_media(
-                            pt_image_paths, displacement_image_paths
+                            pt_image_paths, theta_image_paths, displacement_image_paths
                         ))
 
             if (
@@ -1266,6 +1312,9 @@ class ExampleWrapper(L.LightningModule):
                 # Do not pass W&B's internal `step=` here.  WandbLogger defines
                 # trainer/global_step as the synchronized metric step; an
                 # explicit W&B step would create a second, competing counter.
+                print("\nWANDB MEDIA KEYS\n")
+                for key in sorted(wandb_media.keys()):
+                    print(key)
                 log_wandb_media(self.logger, wandb_media)
 
         if self._ema_restore_state is not None:

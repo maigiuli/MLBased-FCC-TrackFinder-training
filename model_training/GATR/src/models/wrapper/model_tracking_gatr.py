@@ -1,6 +1,6 @@
 import torch
 
-from src.models.Gatr_withModifications_backup import ExampleWrapper, GATR_BACKEND
+from src.models.Gatr_withModifications import ExampleWrapper, GATR_BACKEND
 from src.utils.detector_features import (
     DETECTOR_FEATURE_NAMES,
     DETECTOR_SOURCE_FEATURE_NAMES,

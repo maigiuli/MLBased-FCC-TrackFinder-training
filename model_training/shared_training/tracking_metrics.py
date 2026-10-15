@@ -35,6 +35,7 @@ TRACKING_COUNT_KEYS = (
 # Requested logarithmic pT binning for the validation tracking-efficiency plot.
 TRACKING_PT_BINS = np.exp(np.arange(np.log(0.1), np.log(60.0), 0.2))
 # Explicit uniform 50 mm bins over the tracker-scale displacement range.
+TRACKING_THETA_BINS = np.arange(10.0, 170.0 + 5.0, 5.0)
 TRACKING_DISPLACEMENT_BIN_WIDTH = 50.0
 TRACKING_DISPLACEMENT_BINS = np.arange(
     0.0,
@@ -336,22 +337,33 @@ def tracking_efficiency_binned_counts(
                 continue
 
             for name, bins in checked_bins.items():
-                if name not in info:
-                    missing_particle_info[name] += 1
-                    continue
-                value = float(info[name])
+
+                # theta uses the already-computed angle in degrees.
+                if name == "theta":
+                    value = theta_degrees
+                else:
+                    if name not in info:
+                        missing_particle_info[name] += 1
+                        continue
+
+                    value = float(info[name])
+
                 if not np.isfinite(value) or value < 0:
                     continue
-                # Include an entry exactly on the upper boundary in the final
-                # bin, so the documented 0--2000 mm range is closed at 2000.
+
+                # Include an entry exactly on the upper boundary in the final bin.
                 if value == bins[-1]:
                     bin_index = bins.size - 2
                 else:
                     bin_index = int(np.searchsorted(bins, value, side="right") - 1)
+
                 total, matched = counts[name]
+
                 if bin_index < 0 or bin_index >= total.size:
                     continue
+
                 total[bin_index] += 1
+
                 if int(truth_id) in matched_truth_ids:
                     matched[bin_index] += 1
 
@@ -387,7 +399,40 @@ def tracking_efficiency_pt_counts(
     )
     return counts["pt"][0], counts["pt"][1], missing["pt"]
 
+def tracking_efficiency_theta_counts(
+    events: Sequence[Dict[str, np.ndarray]],
+    tbeta: float,
+    td: float,
+    min_hits: int,
+    bins: np.ndarray = TRACKING_THETA_BINS,
+    metric: str = "double_majority",
+    truth_min_hits: int = 3,
+    min_theta: float = 10.0,
+    max_theta: float = 170.0,
+    gen_status: Sequence[int] = (0, 1),
+    rejected_seed_policy: str = "discard",
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Count total and matched selected truth tracks in theta bins."""
 
+    counts, missing = tracking_efficiency_binned_counts(
+        events,
+        tbeta,
+        td,
+        min_hits,
+        {"theta": bins},
+        metric=metric,
+        truth_min_hits=truth_min_hits,
+        min_theta=min_theta,
+        max_theta=max_theta,
+        gen_status=gen_status,
+        rejected_seed_policy=rejected_seed_policy,
+    )
+
+    return (
+        counts["theta"][0],
+        counts["theta"][1],
+        missing["theta"],
+    )
 def matching_comparison_binned_counts(
     events: Sequence[Dict[str, np.ndarray]],
     working_points: Dict[str, Dict[str, float]],
@@ -478,6 +523,8 @@ def save_tracking_efficiency_pt_plot(
     _log_x: bool = True,
     _text_y: float = 0.5,
     _text_size: float = 17,
+    _major_tick_locator=None,
+    _minor_tick_locator=None
 ):
     """Save binned tracking-efficiency curves for multiple working points.
 
@@ -614,13 +661,22 @@ def save_tracking_efficiency_pt_plot(
         ax.set_ylim([0.01, 1.01])
         ax.legend(loc="lower right", fontsize=17)
         if _log_x:
-            ax.xaxis.set_major_locator(plt.LogLocator(base=10.0, numticks=4))
+            ax.xaxis.set_major_locator(
+                plt.LogLocator(base=10.0, numticks=4)
+            )
             ax.xaxis.set_minor_locator(
                 plt.LogLocator(base=10.0, subs="auto", numticks=10)
             )
         else:
-            ax.xaxis.set_major_locator(plt.MultipleLocator(500.0))
-            ax.xaxis.set_minor_locator(plt.MultipleLocator(50.0))
+            if _major_tick_locator is not None:
+                ax.xaxis.set_major_locator(
+                    plt.MultipleLocator(_major_tick_locator)
+                )
+
+            if _minor_tick_locator is not None:
+                ax.xaxis.set_minor_locator(
+                    plt.MultipleLocator(_minor_tick_locator)
+                )
         ax.yaxis.set_major_locator(plt.MultipleLocator(0.1))
         ax.yaxis.set_minor_locator(plt.MultipleLocator(0.1))
         ax.minorticks_on()
@@ -689,9 +745,41 @@ def save_tracking_efficiency_displacement_plot(
         # text compact and between the data and the legend.
         _text_y=0.40,
         _text_size=15,
+        _major_tick_locator=500.0,
+        _minor_tick_locator=50.0,
     )
 
+def save_tracking_efficiency_theta_plot(
+    series: Sequence[Dict],
+    output_dir: str,
+    filename_stem: str = "tracking_efficiency_vs_theta",
+    bins: np.ndarray = TRACKING_THETA_BINS,
+    min_theta: float = 10.0,
+    max_theta: float = 170.0,
+    gen_status: Sequence[int] = (0, 1),
+    truth_min_hits: int = 3,
+):
+    """Save efficiency versus polar angle theta."""
 
+    return save_tracking_efficiency_pt_plot(
+        series,
+        output_dir,
+        filename_stem=filename_stem,
+        bins=bins,
+        min_x=bins[0],
+        max_x=bins[-1],
+        min_theta=min_theta,
+        max_theta=max_theta,
+        gen_status=gen_status,
+        truth_min_hits=truth_min_hits,
+        _column_prefix="theta_deg",
+        _x_label=r"$\theta$ [deg]",
+        _log_x=False,
+        _text_y=0.40,
+        _text_size=15,
+        _major_tick_locator=20.0,
+        _minor_tick_locator=5.0,
+    )
 def tracking_metrics_from_counts(
     tbeta: float,
     td: float,

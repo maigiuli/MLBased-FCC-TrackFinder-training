@@ -115,6 +115,7 @@ def log_wandb_media(logger, media):
         "plots/operating_point_sweep/",
         "plots/tracking_efficiency_vs_pt/",
         "plots/tracking_efficiency_vs_displacement/",
+        "plots/tracking_efficiency_vs_theta/",
     )
     common_keys = {
         "plots/validation_event_0/hits_by_mc_particle",
@@ -139,12 +140,15 @@ def operating_point_media(output_dir):
     }
 
 
-def tracking_efficiency_media(pt_paths, displacement_paths):
+def tracking_efficiency_media(pt_paths, theta_paths, displacement_paths):
     """Build the identical pT/displacement image payload for both models."""
     media = {}
     for name, path in pt_paths.items():
         if path is not None and Path(path).is_file():
             media[f"plots/tracking_efficiency_vs_pt/{name}"] = wandb_image(path)
+    for name, path in theta_paths.items():
+        if path is not None and Path(path).is_file():
+            media[f"plots/tracking_efficiency_vs_theta/{name}"] = wandb_image(path)
     for name, path in displacement_paths.items():
         if path is not None and Path(path).is_file():
             media[

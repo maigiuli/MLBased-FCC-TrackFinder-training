@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from shared_training.tracking_metrics_backup import greedy_cluster
+from shared_training.tracking_metrics import greedy_cluster
 
 
 def validation_scatter_figure(points, labels, colour_title, title, axis_titles):
