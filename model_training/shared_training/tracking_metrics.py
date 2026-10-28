@@ -276,6 +276,8 @@ def tracking_efficiency_binned_counts(
     truth_min_hits: int = 3,
     min_theta: float = 10.0,
     max_theta: float = 170.0,
+    min_pt: float = 0.1,    
+    max_pt: float = 60.0,
     gen_status: Sequence[int] = (0, 1),
     rejected_seed_policy: str = "discard",
 ) -> Tuple[Dict[str, Tuple[np.ndarray, np.ndarray]], Dict[str, int]]:
@@ -334,6 +336,11 @@ def tracking_efficiency_binned_counts(
             if not (min_theta < theta_degrees < max_theta):
                 continue
             if status not in accepted_status:
+                continue
+            if "pt" not in info:
+                continue
+            pt_value = float(info["pt"])
+            if not np.isfinite(pt_value) or not (min_pt <= pt_value <= max_pt):
                 continue
 
             for name, bins in checked_bins.items():
